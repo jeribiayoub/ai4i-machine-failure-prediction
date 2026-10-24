@@ -6,3 +6,6 @@ xgboost
 joblib
 plotly
 matplotlib
+shap
+lime
+scipy

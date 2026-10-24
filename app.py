@@ -219,9 +219,13 @@ def get_metrics_table(results, y_true, threshold):
 page = st.sidebar.radio(
     "Navigation",
     [
-        "Dashboard", "Dataset Explorer", "Train & Compare",
-        "Evaluation & Prediction", "Live Prediction"
-    ]
+        "Dashboard",
+        "Dataset Explorer",
+        "Train & Compare",
+        "Evaluation & Prediction",
+        "Explainable AI",
+        "Live Prediction",
+    ],
 )
 st.sidebar.divider()
 
@@ -532,6 +536,15 @@ elif page == "Train & Compare":
                 st.session_state["positive_class"] = str(positive_class)
                 st.session_state["data_signature"] = data_signature
                 st.session_state["selected_features"] = selected_features
+                
+                st.session_state["X_train"] = X_train
+
+                # Remove explanations from the previous training run.
+                st.session_state.pop("xai_global_result", None)
+                st.session_state.pop("xai_local_result", None)
+                st.session_state.pop("xai_local_index", None)
+                st.session_state.pop("xai_permutation_result", None)
+                
 
                 if target == "Machine failure" and positive_class == 1 and "XGBoost" in results:
                     joblib.dump(results["XGBoost"]["pipeline"], API_MODEL_PATH)
@@ -702,6 +715,341 @@ elif page == "Evaluation & Prediction":
 # =========================================================
 # 9. LIVE PREDICTION VIA FASTAPI
 # =========================================================
+
+
+# =========================================================
+# EXPLAINABLE AI
+# =========================================================
+elif page == "Explainable AI":
+    import matplotlib.pyplot as plt
+
+    from xai import (
+        get_permutation_importance,
+        calculate_shap,
+        plot_shap_summary,
+        plot_shap_dependence,
+        plot_shap_waterfall,
+        get_lime_explanation,
+    )
+
+    st.title("Explainable AI — Machine Failure Prediction")
+    st.write(
+        "Understand which features influence predictions globally "
+        "and why the model predicts failure for an individual machine."
+    )
+
+    results = st.session_state.get("model_results")
+    X_train = st.session_state.get("X_train")
+    X_test = st.session_state.get("X_test")
+    y_test = st.session_state.get("y_test")
+
+    if not results or X_train is None or X_test is None or y_test is None:
+        st.warning(
+            "No trained models are available. Open Train & Compare, "
+            "train at least one model, then return here."
+        )
+        st.stop()
+
+    if st.session_state.get("data_signature") != data_signature:
+        st.warning("The dataset changed. Please retrain your models first.")
+        st.stop()
+
+    if (
+        st.session_state.get("target_name") != "Machine failure"
+        or st.session_state.get("positive_class") != "1"
+    ):
+        st.warning(
+            "This XAI page is configured for the AI4I target "
+            "'Machine failure', with class 1 meaning failure. "
+            "Train with that target and positive class to continue."
+        )
+        st.stop()
+
+    if "XGBoost" not in results:
+        st.warning(
+            "Train XGBoost as well to use the SHAP and LIME explanations. "
+            "Permutation importance below can still compare the models "
+            "you have trained."
+        )
+
+    tab_global, tab_local = st.tabs(
+        ["Global explanation", "Individual machine explanation"]
+    )
+
+    # -----------------------------------------------------
+    # GLOBAL EXPLANATION
+    # -----------------------------------------------------
+    with tab_global:
+        st.header("1. Permutation importance")
+        st.write(
+            "This measures how much the model's average precision "
+            "changes when one feature is shuffled. Larger positive "
+            "values indicate a more useful feature for this evaluation."
+        )
+
+        available_models = list(results.keys())
+        selected_models_xai = st.multiselect(
+            "Models to compare",
+            available_models,
+            default=available_models,
+            key="xai_permutation_models",
+        )
+
+        if st.button("Calculate permutation importance"):
+            if not selected_models_xai:
+                st.error("Select at least one model.")
+            else:
+                rows = []
+                progress = st.progress(0.0)
+
+                for i, model_name in enumerate(selected_models_xai):
+                    importance_df = get_permutation_importance(
+                        results[model_name]["pipeline"],
+                        X_test,
+                        y_test,
+                        repeats=5,
+                    )
+                    importance_df["Model"] = model_name
+                    rows.append(importance_df)
+                    progress.progress((i + 1) / len(selected_models_xai))
+
+                progress.empty()
+                st.session_state["xai_permutation_result"] = pd.concat(
+                    rows, ignore_index=True
+                )
+
+        permutation_df = st.session_state.get("xai_permutation_result")
+
+        if permutation_df is not None:
+            shown = permutation_df[
+                permutation_df["Model"].isin(selected_models_xai)
+            ]
+            if not shown.empty:
+                st.dataframe(
+                    shown.sort_values(
+                        ["Model", "Importance"], ascending=[True, False]
+                    ).round(4),
+                    use_container_width=True,
+                )
+
+                fig = px.bar(
+                    shown,
+                    x="Importance",
+                    y="Feature",
+                    color="Model",
+                    barmode="group",
+                    orientation="h",
+                    title="Permutation Importance (Average Precision)",
+                )
+                fig.update_layout(yaxis={"categoryorder": "total ascending"})
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.header("2. SHAP global explanation — XGBoost")
+
+        if "XGBoost" in results:
+            st.write(
+                "SHAP estimates how each transformed feature contributes "
+                "to the model output. The plots below use up to 300 "
+                "test observations."
+            )
+
+            if st.button("Generate global SHAP plots"):
+                try:
+                    shap_sample = X_test.sample(
+                        n=min(300, len(X_test)), random_state=42
+                    )
+                    with st.spinner("Calculating SHAP values..."):
+                        shap_result = calculate_shap(
+                            results["XGBoost"]["pipeline"],
+                            X_train,
+                            shap_sample,
+                        )
+                    st.session_state["xai_global_result"] = shap_result
+                    st.success("Global SHAP values calculated.")
+                except Exception as error:
+                    st.error(f"SHAP calculation failed: {error}")
+
+            global_result = st.session_state.get("xai_global_result")
+
+            if global_result is not None:
+                st.subheader("SHAP summary — feature impact")
+                try:
+                    fig = plot_shap_summary(global_result, plot_type="dot")
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+
+                    fig = plot_shap_summary(global_result, plot_type="bar")
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+
+                    st.subheader("SHAP dependence plot")
+                    feature_names = global_result["feature_names"]
+                    chosen_feature = st.selectbox(
+                        "Feature to inspect",
+                        feature_names,
+                        key="xai_dependence_feature",
+                    )
+                    fig = plot_shap_dependence(
+                        global_result, chosen_feature
+                    )
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+
+                except Exception as error:
+                    st.error(f"Could not display a SHAP plot: {error}")
+
+    # -----------------------------------------------------
+    # LOCAL / INDIVIDUAL EXPLANATION
+    # -----------------------------------------------------
+    with tab_local:
+        st.header("3. Explain one machine")
+
+        if "XGBoost" not in results:
+            st.info("Train XGBoost to enable the SHAP and LIME local explanations.")
+        else:
+            sample_index = st.slider(
+                "Select a machine from the test set",
+                min_value=0,
+                max_value=len(X_test) - 1,
+                value=0,
+                key="xai_sample_index",
+            )
+
+            threshold = st.slider(
+                "Failure classification threshold",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.50,
+                step=0.01,
+                key="xai_threshold",
+            )
+
+            sample = X_test.iloc[[sample_index]]
+            pipeline = results["XGBoost"]["pipeline"]
+
+            st.subheader("Machine measurements")
+            st.dataframe(sample, use_container_width=True)
+
+            probability = float(
+                positive_probabilities(pipeline, sample)[0]
+            )
+            prediction = int(probability >= threshold)
+            actual = int(y_test.iloc[sample_index])
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Predicted failure probability", f"{probability:.2%}")
+            col2.metric(
+                "Prediction",
+                "Failure" if prediction == 1 else "No failure",
+            )
+            col3.metric(
+                "Actual test label",
+                "Failure" if actual == 1 else "No failure",
+            )
+
+            st.caption(
+                "SHAP and LIME explain the model's behavior; they do not "
+                "prove that a feature physically caused a machine failure."
+            )
+
+            if st.button("Explain selected machine with SHAP and LIME"):
+                try:
+                    with st.spinner("Calculating local explanations..."):
+                        local_shap = calculate_shap(
+                            pipeline,
+                            X_train,
+                            sample,
+                            max_background=100,
+                        )
+                        local_lime = get_lime_explanation(
+                            pipeline,
+                            X_train,
+                            sample,
+                            num_features=8,
+                        )
+
+                    st.session_state["xai_local_result"] = {
+                        "shap": local_shap,
+                        "lime": local_lime,
+                    }
+                    st.session_state["xai_local_index"] = sample_index
+
+                except Exception as error:
+                    st.error(f"Local explanation failed: {error}")
+
+            local_result = st.session_state.get("xai_local_result")
+            local_index = st.session_state.get("xai_local_index")
+
+            if local_result is not None and local_index == sample_index:
+                st.subheader("SHAP waterfall")
+                try:
+                    fig = plot_shap_waterfall(local_result["shap"])
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+
+                    st.subheader("LIME explanation")
+                    lime_figure = local_result["lime"].as_pyplot_figure(
+                        label=1
+                    )
+                    st.pyplot(lime_figure, clear_figure=True)
+                    plt.close(lime_figure)
+
+                    st.subheader("Top SHAP contributions")
+                    local_shap = local_result["shap"]
+                    contribution_values = local_shap["values"][0]
+                    names = local_shap["feature_names"]
+
+                    contributions = pd.DataFrame({
+                        "Feature": names,
+                        "SHAP contribution": contribution_values,
+                    })
+                    contributions["Direction"] = np.where(
+                        contributions["SHAP contribution"] > 0,
+                        "Pushes model output toward failure",
+                        "Pushes model output away from failure",
+                    )
+                    contributions["Absolute contribution"] = (
+                        contributions["SHAP contribution"].abs()
+                    )
+                    contributions = contributions.sort_values(
+                        "Absolute contribution", ascending=False
+                    )
+
+                    st.dataframe(
+                        contributions[
+                            [
+                                "Feature",
+                                "SHAP contribution",
+                                "Direction",
+                            ]
+                        ].head(8).round(4),
+                        use_container_width=True,
+                    )
+
+                    top_features = contributions.head(3)["Feature"].tolist()
+                    st.write(
+                        "**Main features influencing this model output:** "
+                        + ", ".join(top_features)
+                        + ". Check the plots to see the direction and size "
+                        "of each contribution."
+                    )
+
+                    st.info(
+                        "SHAP and LIME use different approximation methods, "
+                        "so their feature rankings may differ. SHAP values "
+                        "here explain the model output, not a causal effect."
+                    )
+
+                except Exception as error:
+                    st.error(f"Could not display local explanations: {error}")
+            elif local_result is not None:
+                st.info(
+                    "The selected machine changed. Click the explanation "
+                    "button again to explain this machine."
+                )
+
+
 elif page == "Live Prediction":
     st.title("Live Prediction via FastAPI")
     st.write(
